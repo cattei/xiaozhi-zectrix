@@ -85,6 +85,9 @@ endfunction()
 # Set default BUILTIN_TEXT_FONT and BUILTIN_ICON_FONT
 set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
 set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+# 表情字体可按板卡覆盖；默认与上游一致（30px 4bpp），墨水屏板卡可换成
+# font_noto_emoji_30_1（1bpp，纯黑白线条，清晰不糊）
+set(BUILTIN_EMOJI_FONT font_noto_emoji_30_4)
 
 set(EMOTE_RESOLUTION "320_240")
 
@@ -880,6 +883,18 @@ elseif(CONFIG_BOARD_TYPE_LCDWIKI_ES3C35P)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
+elseif(CONFIG_BOARD_TYPE_ZECTRIX_S3_EPAPER_4_2)
+    set(BOARD_TYPE "zectrix-s3-epaper-4.2")
+    set(MANUFACTURER "zectrix")
+    # 24px 1bpp 中文字体（Noto Sans SC Medium，5988 常用字，不依赖 glyph push）
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_24_1)
+    set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+    # 项目自带的单色 emoji（1bpp 线条），墨水屏二值化后仍然完整
+    set(BUILTIN_EMOJI_FONT font_noto_emoji_96_1)
+    list(APPEND SOURCES "fonts/font_noto_sans_basic_24_1.c")
+    list(APPEND SOURCES "fonts/font_noto_emoji_96_1.c")
+    # 自定义休眠/关机图目录（用户可放 sleep.raw）
+    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/boards/zectrix/zectrix-s3-epaper-4.2/assets_extra")
 endif()
 
 if(MANUFACTURER)
@@ -1096,7 +1111,9 @@ idf_component_register(SRCS ${SOURCES}
 if(NOT BOARD_NAME)
     set(BOARD_NAME ${BOARD_TYPE})
 endif()
-string(REGEX MATCH "^font_noto_sans_basic_([0-9]+)_([0-9]+)$" _font_match "${BUILTIN_TEXT_FONT}")
+# Accept any "font_<family>_<size>_<bpp>" name so a board can ship its own
+# font family; size and bpp are parsed from the name below.
+string(REGEX MATCH "^font_[a-z0-9_]+_([0-9]+)_([0-9]+)$" _font_match "${BUILTIN_TEXT_FONT}")
 if(NOT _font_match)
     message(FATAL_ERROR "Unsupported built-in text font name: ${BUILTIN_TEXT_FONT}")
 endif()
@@ -1104,7 +1121,7 @@ set(TEXT_FONT_SIZE "${CMAKE_MATCH_1}")
 set(TEXT_FONT_BPP "${CMAKE_MATCH_2}")
 target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
-                    PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
+                    PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT} BUILTIN_EMOJI_FONT=${BUILTIN_EMOJI_FONT}
                     PRIVATE TEXT_FONT_SIZE=${TEXT_FONT_SIZE} TEXT_FONT_BPP=${TEXT_FONT_BPP}
                     )
 

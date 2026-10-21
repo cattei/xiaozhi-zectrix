@@ -13,7 +13,7 @@
 #include "esp_lvgl_port.h"
 #include "settings.h"
 #include "custom_lcd_display.h"
-#include "common/sleep_manager.h"
+#include "sleep_manager.h"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(font_puhui_basic_30_4);
@@ -88,6 +88,11 @@ void CustomLcdDisplay::lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, 
     assert(disp && area && color_p);
     CustomLcdDisplay *driver = (CustomLcdDisplay *)lv_display_get_user_data(disp);
     assert(driver);
+
+    if (driver->frozen_) {   // 冻结时忽略 LVGL 输出（如显示休眠图/关机后）
+        lv_disp_flush_ready(disp);
+        return;
+    }
 
     if (driver->dirty_mutex) {
         xSemaphoreTake(driver->dirty_mutex, portMAX_DELAY);
@@ -180,7 +185,7 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
     assert(buffer_1);
     lv_display_set_buffers(display_, buffer_1, NULL, BUFF_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    bw_threshold       = 200;
+    bw_threshold       = 160;
 
     sample_interval_ms = 300;
     last_sample_tick = 0;
@@ -313,6 +318,87 @@ void CustomLcdDisplay::RequestUrgentRefresh() {
     }
 }
 
+const char* CustomLcdDisplay::RefreshRateName(RefreshRate rate) {
+    switch (rate) {
+        case RefreshRate::kSlow: return "slow";
+        case RefreshRate::kFast: return "fast";
+        case RefreshRate::kMedium:
+        default: return "medium";
+    }
+}
+
+int CustomLcdDisplay::RefreshRateIntervalMs(RefreshRate rate) {
+    // 两次刷新之间的最小间隔（节流），对局部刷和全刷同样生效
+    switch (rate) {
+        case RefreshRate::kSlow: return 1000;
+        case RefreshRate::kFast: return 100;
+        case RefreshRate::kMedium:
+        default: return 300;
+    }
+}
+
+int CustomLcdDisplay::RefreshRatePartialsBeforeFull(RefreshRate rate) {
+    // 允许连续多少次局部刷之后强制全刷一次（清残影）
+    switch (rate) {
+        case RefreshRate::kSlow: return 30;
+        case RefreshRate::kFast: return 5;
+        case RefreshRate::kMedium:
+        default: return 10;
+    }
+}
+
+// 字体保护：本板的中文字体是专门为 1bpp 墨水屏生成、并编译进固件的。
+// assets 分区里的字体（例如 xiaozhi.me 下发的 assets.bin）通常是 4bpp 抗锯齿版本，
+// 在 1bpp 面板上会发糊；字符集不同还会缺字。所以一律拒绝来自 assets 的字体。
+bool CustomLcdDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
+    (void)text_font;
+    ESP_LOGW(TAG, "ignore text font from assets partition; keep the built-in 1bpp font");
+    return false;
+}
+
+void CustomLcdDisplay::SetRefreshRate(RefreshRate rate) {
+    sample_interval_ms = RefreshRateIntervalMs(rate);
+    partial_before_full_ = RefreshRatePartialsBeforeFull(rate);
+    refresh_rate_ = rate;
+    ESP_LOGI(TAG, "refresh rate = %s (interval %d ms, full refresh every %d partials)",
+             RefreshRateName(rate), sample_interval_ms, partial_before_full_);
+}
+
+void CustomLcdDisplay::ForceFullRedraw() {
+    // 强制 LVGL 全屏重绘，覆盖之前直接写入显存的画面（如休眠图片）
+    if (Lock(2000)) {
+        lv_obj_invalidate(lv_screen_active());
+        Unlock();
+    }
+    RequestUrgentFullRefresh();
+}
+
+void CustomLcdDisplay::SetEmotion(const char* emotion) {
+    // 不做强制全刷：情绪在对话中频繁变化，全刷会导致屏幕频繁闪烁
+    LcdDisplay::SetEmotion(emotion);
+}
+
+void CustomLcdDisplay::SetupUI() {
+    // 先让基类按标准布局创建 UI，再做本板卡的版面微调（只影响 400x300 墨水屏）
+    LcdDisplay::SetupUI();
+    if (!Lock(2000)) {
+        return;
+    }
+    if (emoji_box_ != nullptr) {
+        lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -60);   // 表情上移，给文字让空间
+    }
+    // 表情字体是 96px 的 Noto Emoji（单色线条，OFL 许可），由 BUILTIN_EMOJI_FONT
+    // 指定，尺寸原生就是大的，不需要再做缩放。
+    if (bottom_bar_ != nullptr) {
+        // 文字区至少占下半屏 45%，单行时上对齐、长文本继续向下/向上扩展而不被裁切
+        lv_obj_set_style_min_height(bottom_bar_, LV_VER_RES * 45 / 100, 0);
+    }
+    if (chat_message_label_ != nullptr) {
+        lv_obj_align(chat_message_label_, LV_ALIGN_TOP_MID, 0, 0);
+    }
+    Unlock();
+}
+
 void CustomLcdDisplay::RequestUrgentFullRefresh() {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
@@ -376,7 +462,7 @@ void CustomLcdDisplay::refresh_task_loop() {
     const TickType_t kDebounceTicks = pdMS_TO_TICKS(50);
     const TickType_t kUrgentDebounceTicks = pdMS_TO_TICKS(30);
     const float kMinDiffBitRatio = 0.001f;
-    const float kForceFullDiffRatio = 0.30f;
+    const float kForceFullDiffRatio = 0.15f;
     const int kTinyMaxStreak = 4;
     const size_t kTinyMaxAccumBits = 64 * 8;
     const TickType_t kTinyMaxHoldTicks = pdMS_TO_TICKS(1200);
@@ -435,6 +521,17 @@ void CustomLcdDisplay::refresh_task_loop() {
             if (elapsed < min_ticks) {
                 stat_skip_throttle++;
                 maybe_log_stats(now);
+                // 关键：本次更新已经被从 dirty 取出，必须放回去延后刷新。
+                // 直接丢弃会导致这段内容永远不显示（例如整句对话消息丢失）。
+                xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+                if (rect_area(r) > 0) {
+                    dirty = rect_union(r, dirty);
+                    pending = true;
+                }
+                refresh_in_progress = false;
+                UpdateDisplayBusyLocked();
+                (void)CheckRefreshIdleLocked();
+                xSemaphoreGive(dirty_mutex);
                 TickType_t wait_ticks = min_ticks - elapsed;
                 vTaskDelay(wait_ticks > 0 ? wait_ticks : 1);
                 continue;
@@ -494,6 +591,15 @@ void CustomLcdDisplay::refresh_task_loop() {
             if (!force_due) {
                 stat_skip_tiny++;
                 maybe_log_stats(last_sample_tick);
+                // 同样放回，避免小改动被永久丢弃
+                xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+                if (rect_area(r) > 0) {
+                    dirty = rect_union(r, dirty);
+                    pending = true;
+                }
+                refresh_in_progress = false;
+                UpdateDisplayBusyLocked();
+                xSemaphoreGive(dirty_mutex);
                 vTaskDelay(1);
                 continue;
             }
@@ -514,7 +620,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         if (!should_full && result.diff_ratio >= kForceFullDiffRatio) {
             should_full = true;
         }
-        if (!should_full && partial_since_full >= 10) {
+        if (!should_full && partial_since_full >= partial_before_full_) {
             should_full = true;
         }
 
@@ -533,8 +639,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             partial_since_full = 0;
         } else {
             stat_partial++;
-            EPD_Init();
-            EPD_DisplayPart();
+            EPD_DisplayPartRect(r.x, r.y, r.w, r.h);
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
             partial_since_full++;
@@ -649,8 +754,18 @@ void CustomLcdDisplay::spi_port_rx_init() {
 
 void CustomLcdDisplay::read_busy() {
     int busy = lcd_spi_data.busy;
+    // 用 tick 计数做超时：pdMS_TO_TICKS(5) 在 100Hz tick 下等于 0，vTaskDelay(0) 不延时，
+    // 会导致"超时"瞬间触发。
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t max_wait = pdMS_TO_TICKS(3000);
     while (gpio_get_level((gpio_num_t)busy) == 0) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+        if ((xTaskGetTickCount() - start) > max_wait) {
+            ESP_LOGW(TAG, "EPD busy timeout (GPIO%d still low, pwr=%d vbat=%d rst=%d)",
+                     busy, gpio_get_level((gpio_num_t)lcd_spi_data.power),
+                     gpio_get_level(GPIO_NUM_17), gpio_get_level((gpio_num_t)lcd_spi_data.rst));
+            return;
+        }
+        vTaskDelay(1);
     }
 }
 
@@ -753,6 +868,16 @@ void CustomLcdDisplay::EPD_PowerOff() {
 
 void CustomLcdDisplay::EPD_Init() {
     EPD_PowerOn();
+    // 若 EPD 卡在忙状态（例如关机时刷新未完成），断电再上电强制复位
+    if (gpio_get_level((gpio_num_t)lcd_spi_data.busy) == 0) {
+        ESP_LOGW(TAG, "EPD busy at init, power-cycling panel");
+        gpio_hold_dis((gpio_num_t)lcd_spi_data.power);
+        gpio_set_level((gpio_num_t)lcd_spi_data.power, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level((gpio_num_t)lcd_spi_data.power, 1);
+        gpio_hold_en((gpio_num_t)lcd_spi_data.power);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
     set_rst_1();
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -765,7 +890,7 @@ void CustomLcdDisplay::EPD_Init() {
 
     EPD_SendCommand(0x00);
     EPD_SendData(0x2F);
-    EPD_SendData(0x2E);
+    EPD_SendData(0x0E);
 
     EPD_SendCommand(0xE9);
     EPD_SendData(0x01);
@@ -796,7 +921,7 @@ void CustomLcdDisplay::EPD_Display() {
     const int bytes_per_row_1bpp = (Width + 7) >> 3;
     const int bytes_per_row_out  = bytes_per_row_1bpp * 2;
 
-    std::vector<uint8_t> line(bytes_per_row_out);
+    uint8_t line[128] = {};  // 每行最大 (400/8)*2 = 100 字节，固定缓冲避免频繁堆分配
 
     EPD_SendCommand(0x40);
     read_busy();
@@ -829,7 +954,7 @@ void CustomLcdDisplay::EPD_Display() {
 
     for (int y = 0; y < Height; y++) {
         const uint8_t* src = tx_buf + y * bytes_per_row_1bpp;
-        uint8_t* dst = line.data();
+        uint8_t* dst = line;
 
         for (int xb = 0; xb < bytes_per_row_1bpp; ++xb) {
             uint8_t o0, o1;
@@ -838,7 +963,7 @@ void CustomLcdDisplay::EPD_Display() {
             *dst++ = o1;
         }
 
-        writeBytes(line.data(), bytes_per_row_out);
+        writeBytes(line, bytes_per_row_out);
     }
 
     EPD_TurnOnDisplay();
@@ -912,7 +1037,7 @@ void CustomLcdDisplay::EPD_DisplayPart() {
     const int bytes_per_row_1bpp = (Width + 7) >> 3;
     const int bytes_per_row_out  = bytes_per_row_1bpp * 2;
 
-    std::vector<uint8_t> line(bytes_per_row_out);
+    uint8_t line[128] = {};  // 每行最大 (400/8)*2 = 100 字节，固定缓冲避免频繁堆分配
 
     EPD_SendCommand(0x10);
     read_busy();
@@ -939,10 +1064,73 @@ void CustomLcdDisplay::EPD_DisplayPart() {
             line[2 * j + 1] = (uint8_t)(result & 0xFF);
         }
 
-        writeBytes(line.data(), bytes_per_row_out);
+        writeBytes(line, bytes_per_row_out);
     }
 
     EPD_TurnOnDisplay();
+}
+
+void CustomLcdDisplay::EPD_DisplayPartRect(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+
+    // 窗口对齐到字节边界（X 以字节为单位）
+    int x0 = (x / 8) * 8;
+    int x1 = ((x + w + 7) / 8) * 8 - 1;
+    int y0 = y;
+    int y1 = y + h - 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= Width) x1 = Width - 1;
+    if (y1 >= Height) y1 = Height - 1;
+    if (x1 < x0 || y1 < y0) return;
+
+    const int bytes_per_row_1bpp = (Width + 7) >> 3;
+    const int output_stride = ((x1 - x0 + 1) / 8) * 2;
+
+    EPD_Init();
+
+    // SSD2683 partial refresh 特有命令（参照官方 zectrix_epd 驱动）
+    EPD_SendCommand(0x50);
+    EPD_SendData(0x77);
+    EPD_SendCommand(0xE0);
+    EPD_SendData(0x00);
+    EPD_SendCommand(0xA5);
+    read_busy();
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // SetPartialWindow (0x83)
+    EPD_SendCommand(0x83);
+    EPD_SendData((uint8_t)((x0 >> 8) & 0x03));
+    EPD_SendData((uint8_t)x0);
+    EPD_SendData((uint8_t)((x1 >> 8) & 0x03));
+    EPD_SendData((uint8_t)x1);
+    EPD_SendData((uint8_t)((y0 >> 8) & 0x03));
+    EPD_SendData((uint8_t)y0);
+    EPD_SendData((uint8_t)((y1 >> 8) & 0x03));
+    EPD_SendData((uint8_t)y1);
+    EPD_SendData(0x01);
+
+    EPD_SendCommand(0x10);
+    read_busy();
+
+    // 窗口数据：每 4 像素 1 字节，transition = (old<<1)|new
+    uint8_t line[128] = {};
+    for (int yy = y0; yy <= y1; yy++) {
+        memset(line, 0, output_stride);
+        for (int xx = x0; xx <= x1; xx++) {
+            const uint8_t old_pixel =
+                (prev_buffer[yy * bytes_per_row_1bpp + (xx >> 3)] >> (7 - (xx & 7))) & 1;
+            const uint8_t new_pixel =
+                (tx_buf[yy * bytes_per_row_1bpp + (xx >> 3)] >> (7 - (xx & 7))) & 1;
+            const uint8_t transition = (uint8_t)((old_pixel << 1) | new_pixel);
+            const int relative_x = xx - x0;
+            line[relative_x / 4] |=
+                (uint8_t)(transition << (6 - (relative_x & 3) * 2));
+        }
+        writeBytes(line, output_stride);
+    }
+
+    EPD_TurnOnDisplayPart();
 }
 
 void CustomLcdDisplay::EPD_DrawColorPixel(uint16_t x, uint16_t y, uint8_t color) {
@@ -1117,7 +1305,7 @@ void CustomLcdDisplay::EPD_SetWindows(uint16_t Xstart, uint16_t Ystart, uint16_t
 
 void CustomLcdDisplay::EPD_SetCursor(uint16_t Xstart, uint16_t Ystart) {
     EPD_SendCommand(0x4E);
-    EPD_SendData(Xstart & 0xFF);
+    EPD_SendData((Xstart >> 3) & 0xFF);
 
     EPD_SendCommand(0x4F);
     EPD_SendData(Ystart & 0xFF);

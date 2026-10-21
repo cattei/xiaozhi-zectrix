@@ -66,10 +66,34 @@ public:
     void EPD_DisplayPartBaseImage();
     void EPD_Init_Partial();
     void EPD_DisplayPart();
+    void EPD_DisplayPartRect(int x, int y, int w, int h);
     void EPD_DrawColorPixel(uint16_t x, uint16_t y, uint8_t color);
 
     void RequestUrgentRefresh();
     void RequestUrgentFullRefresh();
+    void SetEmotion(const char* emotion) override;
+    // 拒绝 assets 分区下发的字体，始终使用编译进固件的 1bpp 字体
+    bool SetTextFont(std::shared_ptr<LvglFont> text_font) override;
+    void SetupUI() override;
+    void ForceFullRedraw();
+    void SetFrozen(bool frozen) { frozen_ = frozen; }
+
+    // 刷新档位（语义化）。每个档位映射到两组写死的参数：
+    //   1) minimum interval between two refreshes (throttles every refresh,
+    //      partial or full);
+    //   2) how many partial refreshes are allowed before a forced full refresh
+    //      (full refreshes are what visibly flashes, so a calmer level also
+    //      forces them less often).
+    enum class RefreshRate {
+        kSlow,    // 1000 ms interval, full refresh every 30 partials
+        kMedium,  // 300 ms, every 10 partials (default)
+        kFast,    // 100 ms, every 5 partials
+    };
+    void SetRefreshRate(RefreshRate rate);
+    RefreshRate GetRefreshRate() const { return refresh_rate_; }
+    static const char* RefreshRateName(RefreshRate rate);
+    static int RefreshRateIntervalMs(RefreshRate rate);
+    static int RefreshRatePartialsBeforeFull(RefreshRate rate);
 
     bool IsRefreshPending();
 
@@ -121,7 +145,8 @@ private:
     void WRITE_HLINE_TO_VLINE();
     void WRITE_VLINE_TO_HLINE();
 
-    uint8_t bw_threshold    = 200;
+    uint8_t bw_threshold    = 160;
+    volatile bool frozen_ = false;
 
     void start_refresh_task();
     void stop_refresh_task();
@@ -138,6 +163,8 @@ private:
     bool force_full_refresh_ = false;
     TickType_t last_sample_tick = 0;
     int sample_interval_ms = 300;
+    RefreshRate refresh_rate_ = RefreshRate::kMedium;
+    int partial_before_full_ = 10;
 
     bool prev_buffer_synced = false;
     bool refresh_in_progress = false;

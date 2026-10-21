@@ -5,6 +5,9 @@
 #include <esp_timer.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_sleep.h>
+#include <esp_lvgl_port.h>
+#include <wifi_manager.h>
 
 #include "application.h"
 #include "button.h"
@@ -18,6 +21,8 @@
 #include "zectrix_nfc.h"
 #include "power_save_timer.h"
 #include "mcp_server.h"
+#include "assets.h"
+#include "assets/lang_config.h"
 
 #define TAG "zectrix_s3_epaper_4_2"
 
@@ -89,9 +94,14 @@ static void CheckDualButtonForOtaSwitch() {
         }
     }
     
-    // 恢复GPIO为高阻态，让Button类重新配置
-    gpio_reset_pin(TODO_UP_BUTTON_GPIO);
-    gpio_reset_pin(TODO_DOWN_BUTTON_GPIO);
+    // 恢复 GPIO 为输入上拉（Button 类需要，不能用 gpio_reset_pin 打回高阻）
+    gpio_config_t btn_restore = {};
+    btn_restore.intr_type = GPIO_INTR_DISABLE;
+    btn_restore.mode = GPIO_MODE_INPUT;
+    btn_restore.pin_bit_mask = (1ULL << TODO_UP_BUTTON_GPIO) | (1ULL << TODO_DOWN_BUTTON_GPIO);
+    btn_restore.pull_up_en = GPIO_PULLUP_ENABLE;
+    btn_restore.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&btn_restore);
 }
 
 class CustomBoard : public WifiBoard {
@@ -106,6 +116,7 @@ private:
     std::unique_ptr<RtcPcf8563> rtc_;
     std::unique_ptr<ZectrixNfc> nfc_;
     PowerSaveTimer *power_save_timer_ = nullptr;
+    bool powered_off_ = false;
 
     adc_oneshot_unit_handle_t adc1_handle = nullptr;
     adc_cali_handle_t cali_handle = nullptr;
@@ -123,6 +134,95 @@ private:
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
 
+    void ShowSleepImage() {
+        void* ptr = nullptr;
+        size_t size = 0;
+        display_->SetFrozen(true);   // 冻结 LVGL，避免状态栏/表情覆盖休眠图
+        if (Assets::GetInstance().GetAssetData("sleep.raw", ptr, size) && ptr != nullptr) {
+            display_->WriteRaw1bpp(0, 0, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT,
+                                   (const uint8_t*)ptr, size);
+            display_->RequestUrgentFullRefresh();
+        } else {
+            GetDisplay()->SetEmotion("sleepy");
+            GetDisplay()->SetChatMessage("system", "休眠中");
+        }
+    }
+
+    // 关机：显示休眠图后进入 light sleep，圆键(GPIO0)按下唤醒。
+    // 用 light sleep 而不是 deep sleep：deep sleep 唤醒会重走 ROM bootloader，
+    // 而 GPIO0 正是下载模式 strapping 脚，长按圆键会被误判成下载模式；
+    // light sleep 唤醒不经过 bootloader，长按/短按都不会进下载模式。
+    // 注意不能用 VbatPowerOff()：VBAT 是主控自己的电池供电开关，切断后
+    // 纯电池状态下整机掉电，圆键再也无法开机。
+    void EnterLightSleep() {
+        ESP_LOGI(TAG, "Shutdown: stopping audio/wifi/lvgl before light sleep");
+        power_->PowerAudioOff();
+        // 停 WiFi 与 LVGL tick：避免它们阻止进入 light sleep 或周期唤醒
+        WifiManager::GetInstance().StopStation();
+        WifiManager::GetInstance().StopConfigAp();
+        vTaskDelay(pdMS_TO_TICKS(200));   // 让断网事件处理完再停 LVGL
+        lvgl_port_stop();
+
+        // 长按关机时用户可能还按着圆键，先等松开，否则 ext0 会立刻唤醒
+        while (gpio_get_level(GPIO_NUM_0) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        // 清空所有唤醒源，只保留圆键(GPIO0)低电平唤醒
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+
+        ESP_LOGI(TAG, "Shutdown: entering light sleep (wake on BOOT button)");
+        esp_light_sleep_start();
+
+        // 圆键唤醒。等松开再重启：软复位时 bootloader 仍会采样 GPIO0，
+        // 若此时还按着就会被当成下载模式。
+        ESP_LOGI(TAG, "Woken from light sleep, waiting for BOOT release");
+        while (gpio_get_level(GPIO_NUM_0) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        ESP_LOGI(TAG, "Powering on (restart)");
+        power_->VbatPowerOn();
+        power_->PowerAudioOn();
+        power_->PowerEpdOn();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+    }
+
+    // 关机流程放到独立任务执行：按钮/PowerSaveTimer 的回调都在 esp_timer 任务里，
+    // 在里面 vTaskDelay 会阻塞所有 esp_timer 回调（含省电定时器自身）。
+    static void ShutdownTask(void* arg) {
+        CustomBoard* self = static_cast<CustomBoard*>(arg);
+        for (int i = 0; i < 200 && self->display_ != nullptr && self->display_->IsRefreshPending(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        self->EnterLightSleep();
+    }
+
+    void Shutdown() {
+        if (powered_off_) return;
+        powered_off_ = true;
+        ESP_LOGI(TAG, "Shutdown: showing sleep image");
+        ShowSleepImage();
+        if (xTaskCreate(ShutdownTask, "shutdown", 3072, this, 5, nullptr) != pdPASS) {
+            ESP_LOGE(TAG, "Shutdown: failed to create task, sleeping in place");
+            EnterLightSleep();
+        }
+    }
+
+    void PowerOn() {
+        if (!powered_off_) return;
+        powered_off_ = false;
+        // 外设断电后需要重新初始化（音频/屏幕），直接重启最干净
+        power_->VbatPowerOn();
+        power_->PowerAudioOn();
+        power_->PowerEpdOn();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+    }
+
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto &app = Application::GetInstance();
@@ -130,15 +230,15 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+            if (powered_off_) {
+                PowerOn();
+                return;
+            }
             app.ToggleChatState();
         });
 
         boot_button_.OnLongPress([this]() {
-            GetDisplay()->SetChatMessage("system", "OFF");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            power_->PowerAudioOff();
-            power_->PowerEpdOff();
-            power_->VbatPowerOff();
+            Shutdown();
         });
 
         up_button_.OnClick([this]() {
@@ -147,6 +247,14 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+            power_save_timer_->WakeUp();
+            auto codec = GetAudioCodec();
+            auto volume = codec->output_volume() + 10;
+            if (volume > 100) {
+                volume = 100;
+            }
+            codec->SetOutputVolume(volume);
+            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume / 10));
         });
 
         down_button_.OnClick([this]() {
@@ -155,23 +263,34 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+            power_save_timer_->WakeUp();
+            auto codec = GetAudioCodec();
+            auto volume = codec->output_volume() - 10;
+            if (volume < 0) {
+                volume = 0;
+            }
+            codec->SetOutputVolume(volume);
+            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume / 10));
         });
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 20, 300);
+        // 参数: (cpu_max_freq, 休眠秒数, 关机秒数) = 10 分钟休眠 / 30 分钟关机
+        power_save_timer_ = new PowerSaveTimer(-1, 600, 1800);
         power_save_timer_->OnEnterSleepMode([this]() {
+            if (powered_off_) return;   // 已关机，无需再处理
             ESP_LOGI(TAG, "Entering sleep mode");
+            ShowSleepImage();
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            if (powered_off_) return;   // 关机状态下外设已断电，不要刷新/解冻
             ESP_LOGI(TAG, "Exiting sleep mode");
+            display_->SetFrozen(false);   // 解冻 LVGL
+            GetDisplay()->SetEmotion("neutral");
+            display_->ForceFullRedraw();  // 清除休眠图片
         });
         power_save_timer_->OnShutdownRequest([this]() {
-            GetDisplay()->SetChatMessage("system", "OFF");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            power_->PowerAudioOff();
-            power_->PowerEpdOff();
-            power_->VbatPowerOff();
+            Shutdown();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -182,6 +301,65 @@ private:
             EnterWifiConfigMode();
             return true;
         });
+
+        // 刷新档位：只控制"刷新节流间隔"和"全刷周期"；局部刷/全刷仍由内容差异决定
+        mcp_server.AddTool("self.disp.set_refresh_rate",
+                           "Set how eagerly the e-paper refreshes. Allowed values: "
+                           "\"slow\", \"medium\" (default), \"fast\". "
+                           "Each level is a fixed pair: the minimum interval between two refreshes, "
+                           "and how many partial refreshes are allowed before a forced full refresh. "
+                           "slow = 1000 ms interval + full refresh every 30 partials (calmest, least "
+                           "flashing, display a bit stale); "
+                           "medium = 300 ms + every 10 partials; "
+                           "fast = 100 ms + every 5 partials (most responsive, more flashing). "
+                           "This throttles both partial and full refreshes; whether a given update is "
+                           "partial or full is still decided by how much of the content changed.",
+                           PropertyList({Property("rate", kPropertyTypeString, std::string("medium"))}),
+                           [this](const PropertyList &properties) -> ReturnValue {
+                               const std::string rate = properties["rate"].value<std::string>();
+                               CustomLcdDisplay::RefreshRate target;
+                               if (rate == "slow") {
+                                   target = CustomLcdDisplay::RefreshRate::kSlow;
+                               } else if (rate == "fast") {
+                                   target = CustomLcdDisplay::RefreshRate::kFast;
+                               } else if (rate == "medium") {
+                                   target = CustomLcdDisplay::RefreshRate::kMedium;
+                               } else {
+                                   return std::string("unknown rate '") + rate +
+                                          "', expected slow|medium|fast";
+                               }
+                               display_->SetRefreshRate(target);
+                               return std::string("refresh rate set to ") +
+                                      CustomLcdDisplay::RefreshRateName(target) + " (interval " +
+                                      std::to_string(CustomLcdDisplay::RefreshRateIntervalMs(target)) +
+                                      " ms, full refresh every " +
+                                      std::to_string(
+                                          CustomLcdDisplay::RefreshRatePartialsBeforeFull(target)) +
+                                      " partial refreshes)";
+                           });
+
+        mcp_server.AddTool("self.disp.get_refresh_rate",
+                           "Get the current e-paper refresh rate: level, minimum interval between "
+                           "two refreshes, and how often a full refresh is forced.",
+                           PropertyList(), [this](const PropertyList &) -> ReturnValue {
+                               const auto rate = display_->GetRefreshRate();
+                               return std::string("refresh rate is ") +
+                                      CustomLcdDisplay::RefreshRateName(rate) + " (interval " +
+                                      std::to_string(CustomLcdDisplay::RefreshRateIntervalMs(rate)) +
+                                      " ms, full refresh every " +
+                                      std::to_string(
+                                          CustomLcdDisplay::RefreshRatePartialsBeforeFull(rate)) +
+                                      " partial refreshes)";
+                           });
+
+        // 立即做一次全屏刷新（清残影）
+        mcp_server.AddTool("self.disp.refresh_now",
+                           "Force a full-screen refresh now. Use it when the screen shows ghosting "
+                           "or leftover content.",
+                           PropertyList(), [this](const PropertyList &) -> ReturnValue {
+                               display_->RequestUrgentFullRefresh();
+                               return true;
+                           });
     }
 
     void InitializeLcdDisplay() {
@@ -212,9 +390,21 @@ private:
         power_->VbatPowerOn();
         power_->PowerAudioOn();
         power_->PowerEpdOn();
+        // VBAT 反馈引脚（GPIO18，同时也是下键）配置为输入上拉，避免高阻读到低电平
+        gpio_config_t vbat_gpio = {};
+        vbat_gpio.intr_type = GPIO_INTR_DISABLE;
+        vbat_gpio.mode = GPIO_MODE_INPUT;
+        vbat_gpio.pin_bit_mask = 1ULL << VBAT_PWR_GPIO;
+        vbat_gpio.pull_up_en = GPIO_PULLUP_ENABLE;
+        vbat_gpio.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        gpio_config(&vbat_gpio);
+        int vbat_timeout = 100;
         do {
             vTaskDelay(pdMS_TO_TICKS(10));
-        } while (!gpio_get_level(static_cast<gpio_num_t>(VBAT_PWR_GPIO)));
+        } while (!gpio_get_level(static_cast<gpio_num_t>(VBAT_PWR_GPIO)) && --vbat_timeout > 0);
+        if (vbat_timeout <= 0) {
+            ESP_LOGW(TAG, "VBAT feedback GPIO%d not asserted, continuing anyway", VBAT_PWR_GPIO);
+        }
     }
 
     void InitializeRtc() {
@@ -236,6 +426,9 @@ private:
     }
 
     void ChargeStatusTick() {
+        // 注意：不要在这里根据 DeviceState 变化强制全刷。状态栏文字（说话中/聆听中、
+        // 时间、电量、网络）本来就只是局部变化，强制全刷会让每次状态切换都闪一次。
+        // 残影由 refresh 任务的「每 N 次局部刷强制全刷一次」兜底。
         int64_t now_ms = esp_timer_get_time() / 1000;
         charge_status_.Tick(now_ms);
 
@@ -301,6 +494,12 @@ public:
         : boot_button_(BOOT_BUTTON_GPIO),
           up_button_(TODO_UP_BUTTON_GPIO),
           down_button_(TODO_DOWN_BUTTON_GPIO) {
+        // deep sleep 唤醒后电源 GPIO 可能仍处于 hold 状态，先解除以便重新配置
+        gpio_hold_dis(EPD_PWR_PIN);
+        gpio_hold_dis(EPD_RST_PIN);
+        gpio_hold_dis(VBAT_PWR_PIN);
+        gpio_hold_dis(Audio_PWR_PIN);
+        gpio_hold_dis(Audio_AMP_PIN);
         // 在最早期检测双按钮切换OTA分区
         CheckDualButtonForOtaSwitch();
         
@@ -329,6 +528,13 @@ public:
     }
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
+        if (powered_off_) {
+            // 已关机：外设断电后电池读数不可靠，报告充电态避免误报"电量低"
+            level = 100;
+            charging = true;
+            discharging = false;
+            return true;
+        }
         ChargeStatusTick();
         auto snap = charge_status_.Get();
         charging = snap.charging;

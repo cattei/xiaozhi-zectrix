@@ -30,7 +30,7 @@ public:
     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);
     virtual bool AddTextGlyphs(const std::vector<TextGlyph>& glyphs, uint8_t bpp) override;
     virtual void ClearTextGlyphs() override;
-    bool SetTextFont(std::shared_ptr<LvglFont> text_font);
+    virtual bool SetTextFont(std::shared_ptr<LvglFont> text_font);
 
 protected:
     esp_pm_lock_handle_t pm_lock_ = nullptr;

@@ -22,13 +22,13 @@
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_material_symbols_30_4);
-LV_FONT_DECLARE(font_noto_emoji_30_4);
+LV_FONT_DECLARE(BUILTIN_EMOJI_FONT);
 
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
     auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
-    auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
+    auto emoji_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_EMOJI_FONT);
 
     // light theme
     auto light_theme = new LvglTheme("light");
